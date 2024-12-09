@@ -1,0 +1,296 @@
+import pandas as pd
+import numpy as np
+import requests
+import datetime
+from zoneinfo import ZoneInfo  # Import ZoneInfo for timezone handling
+
+def fetch_oanda_candles(access_token, account_id, instrument, granularity, from_time=None, to_time=None, count=500, environment='live'):
+    """
+    Fetch historical candlestick data from OANDA API.
+
+    Parameters:
+    - access_token: str, your OANDA API access token.
+    - account_id: str, your OANDA account ID.
+    - instrument: str, the financial instrument (e.g., 'USD_JPY').
+    - granularity: str, time granularity (e.g., 'M10' for 10-minute).
+    - from_time: str, ISO8601 formatted start time (optional).
+    - to_time: str, ISO8601 formatted end time (optional).
+    - count: int, number of candlesticks to fetch (max 500 per request).
+    - environment: str, 'live' or 'practice'.
+
+    Returns:
+    - DataFrame with columns: 'Date', 'Open', 'High', 'Low', 'Close', 'Volume'
+    """
+    # Define the base URL based on environment
+    if environment == 'live':
+        base_url = 'https://api-fxtrade.oanda.com'
+    elif environment == 'practice':
+        base_url = 'https://api-fxpractice.oanda.com'
+    else:
+        raise ValueError("Environment must be 'live' or 'practice'.")
+
+    endpoint = f"/v3/instruments/{instrument}/candles"
+    url = base_url + endpoint
+
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    params = {
+        "granularity": granularity,
+        "count": count,
+        "price": "M",  # Midpoint prices
+    }
+
+    if from_time:
+        params["from"] = from_time
+    if to_time:
+        params["to"] = to_time
+
+    response = requests.get(url, headers=headers, params=params)
+
+    if response.status_code != 200:
+        raise Exception(f"Error fetching data from OANDA API: {response.text}")
+
+    data = response.json()
+
+    candles = data.get('candles', [])
+    if not candles:
+        raise Exception("No candlestick data found.")
+
+    records = []
+    for candle in candles:
+        if candle['complete']:
+            time_str = candle['time']
+            dt = pd.to_datetime(time_str)
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))  # Ensure timezone-aware datetime
+            open_p = float(candle['mid']['o'])
+            high_p = float(candle['mid']['h'])
+            low_p = float(candle['mid']['l'])
+            close_p = float(candle['mid']['c'])
+            volume = int(candle['volume'])
+            records.append({
+                'Date': dt,
+                'Open': open_p,
+                'High': high_p,
+                'Low': low_p,
+                'Close': close_p,
+                'Volume': volume
+            })
+
+    df = pd.DataFrame(records)
+    df.set_index('Date', inplace=True)
+    df.sort_index(inplace=True)
+    return df
+
+def calculate_supertrend(df, period, multiplier, src='hl2'):
+    """
+    Calculate Supertrend indicator.
+
+    Parameters:
+    - df: DataFrame with 'High', 'Low', 'Close' columns.
+    - period: int, ATR period.
+    - multiplier: float, ATR multiplier.
+    - src: str, source for Supertrend calculation ('hl2' by default).
+
+    Returns:
+    - DataFrame with Supertrend columns: 'supertrend', 'trend'.
+    """
+    if src == 'hl2':
+        df['src'] = (df['High'] + df['Low']) / 2
+    else:
+        df['src'] = df[src]
+
+    # Calculate ATR using True Range
+    df['TR'] = np.maximum(df['High'] - df['Low'],
+                          np.maximum(abs(df['High'] - df['Close'].shift(1)),
+                                     abs(df['Low'] - df['Close'].shift(1))))
+    df['ATR'] = df['TR'].rolling(window=period, min_periods=1).mean()
+
+    # Calculate basic upper and lower bands
+    df['upperband'] = df['src'] + (multiplier * df['ATR'])
+    df['lowerband'] = df['src'] - (multiplier * df['ATR'])
+
+    # Initialize Supertrend
+    df['supertrend'] = np.nan
+    df['trend'] = 1  # 1 for uptrend, -1 for downtrend
+
+    for current in range(1, len(df)):
+        previous_supertrend = df.at[df.index[current - 1], 'supertrend']
+        previous_trend = df.at[df.index[current - 1], 'trend']
+
+        # Determine trend direction
+        if df.at[df.index[current], 'Close'] > previous_supertrend:
+            current_trend = 1
+        elif df.at[df.index[current], 'Close'] < previous_supertrend:
+            current_trend = -1
+        else:
+            current_trend = previous_trend
+
+        df.at[df.index[current], 'trend'] = current_trend
+
+        # Set Supertrend value
+        if current_trend == 1:
+            df.at[df.index[current], 'supertrend'] = df.at[df.index[current], 'lowerband']
+        else:
+            df.at[df.index[current], 'supertrend'] = df.at[df.index[current], 'upperband']
+
+    return df[['supertrend', 'trend']]
+
+def calculate_triple_supertrend_custom(df, period1=10, multiplier1=1.0,
+                                      period2=11, multiplier2=2.0,
+                                      period3=12, multiplier3=3.0):
+    """
+    Calculate Triple Supertrend Custom indicator.
+
+    Parameters:
+    - df: DataFrame with 'High', 'Low', 'Close' columns.
+    - period1, multiplier1: ATR period and multiplier for Supertrend 1.
+    - period2, multiplier2: ATR period and multiplier for Supertrend 2.
+    - period3, multiplier3: ATR period and multiplier for Supertrend 3.
+
+    Returns:
+    - DataFrame with Triple Supertrend Custom indicators.
+    """
+    # Calculate Supertrend 1
+    st1 = calculate_supertrend(df.copy(), period1, multiplier1, src='hl2')
+    df = df.join(st1.rename(columns={'supertrend': 'supertrend_1', 'trend': 'trend_1'}))
+
+    # Calculate Supertrend 2
+    st2 = calculate_supertrend(df.copy(), period2, multiplier2, src='hl2')
+    df = df.join(st2.rename(columns={'supertrend': 'supertrend_2', 'trend': 'trend_2'}))
+
+    # Calculate Supertrend 3
+    st3 = calculate_supertrend(df.copy(), period3, multiplier3, src='hl2')
+    df = df.join(st3.rename(columns={'supertrend': 'supertrend_3', 'trend': 'trend_3'}))
+
+    # Initialize additional trend variables for Supertrend 2 and 3
+    df['trend_2_2'] = 1
+    df['trend_3_2'] = 1
+
+    # Iterate to set trend_2_2 and trend_3_2 based on custom logic
+    for current in range(1, len(df)):
+        # Supertrend 2_2
+        prev_trend_2_2 = df.at[df.index[current - 1], 'trend_2_2']
+        current_close = df.at[df.index[current], 'Close']
+        dn1 = df.at[df.index[current - 1], 'supertrend_1']
+        up1_2 = df.at[df.index[current - 1], 'supertrend_2']
+
+        if prev_trend_2_2 == -1 and current_close > dn1:
+            df.at[df.index[current], 'trend_2_2'] = 1
+        elif prev_trend_2_2 == 1 and current_close < up1_2:
+            df.at[df.index[current], 'trend_2_2'] = -1
+        else:
+            df.at[df.index[current], 'trend_2_2'] = prev_trend_2_2
+
+        # Supertrend 3_2
+        prev_trend_3_2 = df.at[df.index[current - 1], 'trend_3_2']
+        up1_3 = df.at[df.index[current - 1], 'supertrend_3']
+
+        if prev_trend_3_2 == -1 and current_close > dn1:
+            df.at[df.index[current], 'trend_3_2'] = 1
+        elif prev_trend_3_2 == 1 and current_close < up1_3:
+            df.at[df.index[current], 'trend_3_2'] = -1
+        else:
+            df.at[df.index[current], 'trend_3_2'] = prev_trend_3_2
+
+    # Final Alert Conditions
+    # Green Alert: All Supertrends are uptrend (1) and were not all uptrend in the previous candle
+    df['green_alert'] = (
+        (df['trend_1'] == 1) &
+        (df['trend_2_2'] == 1) &
+        (df['trend_3_2'] == 1) &
+        (~((df['trend_1'].shift(1) == 1) &
+           (df['trend_2_2'].shift(1) == 1) &
+           (df['trend_3_2'].shift(1) == 1)))
+    )
+
+    # Red Alert: All Supertrends are downtrend (-1) and were not all downtrend in the previous candle
+    df['red_alert'] = (
+        (df['trend_1'] == -1) &
+        (df['trend_2_2'] == -1) &
+        (df['trend_3_2'] == -1) &
+        (~((df['trend_1'].shift(1) == -1) &
+           (df['trend_2_2'].shift(1) == -1) &
+           (df['trend_3_2'].shift(1) == -1)))
+    )
+
+    return df
+
+def generate_alerts(df):
+    """
+    Generate alert signals based on Triple Supertrend Custom.
+
+    Parameters:
+    - df: DataFrame with Triple Supertrend Custom indicators.
+
+    Returns:
+    - List of alerts with timestamp and alert type.
+    """
+    alerts = []
+
+    for idx, row in df.iterrows():
+        if row['green_alert']:
+            # Convert timestamp from UTC to PST
+            pst_time = idx.astimezone(ZoneInfo("America/Los_Angeles"))
+            alerts.append({'Date': pst_time, 'Alert': 'Green Alert - All Supertrends Uptrend'})
+        elif row['red_alert']:
+            # Convert timestamp from UTC to PST
+            pst_time = idx.astimezone(ZoneInfo("America/Los_Angeles"))
+            alerts.append({'Date': pst_time, 'Alert': 'Red Alert - All Supertrends Downtrend'})
+
+    return alerts
+
+def main():
+    """Main function to fetch data, calculate Triple Supertrend Custom, and print alerts."""
+    # OANDA API credentials
+    access_token = '7b245c14048e6b0932b06ad7660f31a7-390ae510a282dadebff5035fb54b92c1'
+    account_id = '001-001-10843316-001'
+    instrument = 'USD_JPY'
+    granularity = 'M10'  # 10-minute granularity
+    environment = 'live'  # Set to 'live' for live accounts or 'practice' for demo accounts
+
+    # Fetch historical data from OANDA
+    try:
+        print("Fetching data from OANDA API...")
+        df = fetch_oanda_candles(
+            access_token=access_token,
+            account_id=account_id,
+            instrument=instrument,
+            granularity=granularity,
+            count=500,  # Adjust the count as needed (max 500 per request)
+            environment=environment
+        )
+        print(f"Fetched {len(df)} records.")
+    except Exception as e:
+        print(f"Error: {e}")
+        return
+
+    # Check if data is sufficient
+    if df.empty:
+        print("No data fetched. Please check the instrument and parameters.")
+        return
+
+    # Calculate Triple Supertrend Custom
+    print("Calculating Triple Supertrend Custom indicators...")
+    df = calculate_triple_supertrend_custom(df)
+
+    # Generate Alerts
+    print("Generating alerts...")
+    alerts = generate_alerts(df)
+
+    # Check if there are any alerts
+    if not alerts:
+        print("No alerts found in the fetched data.")
+        return
+
+    # Get the most recent 3 alerts
+    recent_alerts = alerts[-3:]
+
+    print("\nMost Recent 3 Alert Signals:")
+    for alert in recent_alerts:
+        date_str = alert['Date'].strftime('%Y-%m-%d %H:%M %Z')
+        print(f"{date_str} - {alert['Alert']}")
+
+if __name__ == "__main__":
+    main()
